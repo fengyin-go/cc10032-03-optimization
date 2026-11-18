@@ -89,6 +89,10 @@ class Store:
         self._channels: dict[str, DataChannelEvent] = {}
         # 失败恢复记录：recovery_id → FailureRecovery
         self._failures: dict[str, FailureRecovery] = {}
+        # 结果落地恢复引擎的内部表（不参与通用 CRUD / 概览统计）
+        self._internal_tables: set[str] = set()
+        # 幂等失败登记索引：idempotency_key → recovery_id，保证同一异常只登记一次
+        self._failure_idempotency: dict[str, str] = {}
 
     # ---- 跨模块数据通道 ----
 
@@ -167,8 +171,17 @@ class Store:
         error: str,
         strategy: str = "retry",
         context: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> FailureRecovery:
-        """注册失败事件并创建恢复记录。"""
+        """注册失败事件并创建恢复记录。
+
+        传入 idempotency_key 时按幂等键去重：同一异常（如序号3的并发异常）
+        在任何恢复轮次里只登记一条记录，重复登记直接返回既有记录。
+        """
+        if idempotency_key is not None:
+            existing_id = self._failure_idempotency.get(idempotency_key)
+            if existing_id is not None:
+                return self._failures[existing_id]
         import hashlib
         rid = hashlib.md5(
             f"{module}_{operation}_{time.time()}".encode()
@@ -182,7 +195,14 @@ class Store:
             context=context or {},
         )
         self._failures[rid] = recovery
+        if idempotency_key is not None:
+            self._failure_idempotency[idempotency_key] = rid
         return recovery
+
+    def register_internal_table(self, name: str) -> None:
+        """注册内部表：保留 rows() 访问能力，但不进入模块清单与概览统计。"""
+        self._tables.setdefault(name, [])
+        self._internal_tables.add(name)
 
     def get_open_failures(self, module: str | None = None) -> list[FailureRecovery]:
         """获取未恢复的失败记录。"""
@@ -217,7 +237,7 @@ class Store:
     # ---- 基础 CRUD ----
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in self._internal_tables)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])

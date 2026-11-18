@@ -171,28 +171,41 @@ def sink_results_to_store(
     sink_name: str,
     output_type: str = "append",
 ) -> tuple[int, str]:
-    """将窗口聚合结果写入目标存储（模拟落库）。"""
+    """将窗口聚合结果写入目标存储（按窗口键幂等落库）。
+
+    委托落库恢复引擎：同一窗口键在一次发布中只产生一条成功记录，
+    重试从失败分组继续，避免整批重写造成重复指标。
+    """
+    from app.services.landing_recovery import WindowMetric, landing_engine
+
     rows = store.rows("sink_output")
     sink = next((r for r in rows if r.get("配置名称") == sink_name), None)
     if sink is None:
         return 0, f"未找到输出配置 {sink_name}"
-    written = 0
-    for wr in results:
-        entry = {
-            "sink": sink_name,
-            "window_key": wr.window_key,
-            "aggregates": wr.aggregates,
-            "row_count": wr.row_count,
-            "watermark": wr.watermark,
-            "timestamp": time.time(),
-        }
-        store.rows("sink_output").append(entry)
-        written += 1
+
+    metrics = [
+        WindowMetric(
+            window_key=wr.window_key,
+            aggregates=wr.aggregates,
+            row_count=wr.row_count,
+            watermark=wr.watermark,
+            start_ts=wr.start_ts,
+            end_ts=wr.end_ts,
+            partition=wr.window_key,
+            source_batch=f"pipeline_{int(time.time() * 1000)}",
+        )
+        for wr in results
+    ]
+    if not metrics:
+        return 0, f"无窗口结果需要写入 {sink_name}"
+
+    outcome = landing_engine.publish_window_metrics(sink_name, metrics)
+    written = outcome.success_groups
     # 更新目标状态为"已生效"
-    if sink.get("status") == "草稿":
+    if sink.get("status") == "草稿" and outcome.failed_groups == 0:
         sink["status"] = "已生效"
         sink["pending"] = True
-    return written, f"成功写入 {written} 条记录到 {sink_name}"
+    return written, f"成功写入 {written} 条唯一窗口记录到 {sink_name}（版本 v{outcome.version}）"
 
 
 # ---- 链路2: watermark_track → late_handler → backfill_job ----
@@ -732,16 +745,30 @@ def verify_sink_integrity(
     window_results: list[WindowResult],
     sink_module: str = "sink_output",
 ) -> dict[str, Any]:
-    """验证窗口聚合结果是否完整落地。"""
-    written_keys = set()
-    for row in store.rows(sink_module):
-        if isinstance(row.get("window_key"), str):
-            written_keys.add(row["window_key"])
+    """验证窗口聚合结果是否完整落地（按窗口键去重，只认可消费成功记录）。"""
+    from app.services.landing_recovery import LANDING_TABLE, landing_engine
+
     expected_keys = {wr.window_key for wr in window_results}
+    # 以 sink_output 全部成功落地记录的唯一窗口键为准，半成品与冻结版本不计入
+    written_keys: set[str] = set()
+    for row in store.rows(LANDING_TABLE):
+        if row.get("write_status") != "success":
+            continue
+        pub = landing_engine.get_publication(row["publication_id"])
+        if pub is None or pub["status"] in ("写入中", "已中断", "已冻结"):
+            continue
+        written_keys.add(row["window_key"])
     missing = expected_keys - written_keys
+    # 重复记录检测：同一窗口键落地超过一条即视为重复
+    key_counts: dict[str, int] = {}
+    for row in store.rows(LANDING_TABLE):
+        if row.get("write_status") == "success":
+            key_counts[row["window_key"]] = key_counts.get(row["window_key"], 0) + 1
+    duplicate_keys = sorted(key for key, count in key_counts.items() if count > 1)
     return {
         "expected": len(expected_keys),
-        "written": len(written_keys),
+        "written": len(written_keys & expected_keys),
         "missing": list(missing),
+        "duplicate_keys": duplicate_keys,
         "complete": len(missing) == 0,
     }

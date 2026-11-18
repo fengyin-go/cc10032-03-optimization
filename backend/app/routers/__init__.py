@@ -1,6 +1,8 @@
-"""业务路由汇总：所有模块共用一套资源路由，由领域服务完成分派。"""
+"""业务路由汇总：通用资源路由 + 结果落地恢复专用路由。"""
 from __future__ import annotations
 
-from app.routers import resource
+from app.routers import resource, sink_recovery
 
-ROUTERS = [resource]
+# sink_recovery 全部为 /api/sink-recovery/* 固定前缀，
+# 与 /api/{module} 动态资源路由不冲突，顺序注册即可。
+ROUTERS = [sink_recovery, resource]
